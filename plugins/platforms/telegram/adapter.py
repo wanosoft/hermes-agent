@@ -6198,7 +6198,14 @@ class TelegramAdapter(TelegramHeldInboundMixin, TelegramTopicRoutingMixin, BaseP
 
     def _telegram_group_observe_shared_source(self, source):
         """Return a chat/topic-scoped source for observed Telegram group context."""
-        return dataclasses.replace(source, user_id=None, user_name=None, user_id_alt=None)
+        shared = dataclasses.replace(source, user_id=None, user_name=None, user_id_alt=None)
+        # SessionSource keeps live transport provenance as dynamic attributes;
+        # dataclasses.replace copies only declared fields. Preserve it so a
+        # multiplexed default bot can authorize and deliver a routed turn.
+        for attr in ("_transport_adapter_ref", "_authorization_profile_home"):
+            if hasattr(source, attr):
+                setattr(shared, attr, getattr(source, attr))
+        return shared
 
     def _telegram_group_observe_attributed_text(self, event: MessageEvent) -> str:
         user_id = event.source.user_id or "unknown"
@@ -6571,7 +6578,51 @@ class TelegramAdapter(TelegramHeldInboundMixin, TelegramTopicRoutingMixin, BaseP
         super()._enqueue_text_event(event)
         self._accept_update()
 
-    async def _flush_buffered(self, pending: dict, tasks: dict, key: str, delay: float, where: str, log_fn=None) -> None:
+    async def _jev_allows_reply(self, event: MessageEvent) -> bool:
+        """Gate addressed group replies through the optional TypeSafe helper."""
+        extra = getattr(self.config, "extra", {}) or {}
+        if not extra.get("jev_reply_gate", False) or getattr(event.source, "chat_type", None) != "group":
+            return True
+        payload = {
+            "state": {"chat_type": event.source.chat_type, "chat_id": event.source.chat_id, "message": event.text or ""},
+            "model": "jev-latest",
+            "questions": {"action": {"type": "choice", "instructions": "What should the agent do with this addressed group message?", "criteria": {
+                "silence": "Do not reply; ordinary chatter or no useful answer.",
+                "answer": "Reply directly; actionable question or request.",
+                "escalate": "Do not reply automatically; a human decision is needed.",
+            }}},
+        }
+        process = None
+        try:
+            from hermes_constants import get_hermes_home
+            script_path = get_hermes_home() / "scripts" / "jev.py"
+            process = await asyncio.create_subprocess_exec(
+                str(script_path), "--raw",
+                stdin=asyncio.subprocess.PIPE, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
+            )
+            stdout, stderr = await asyncio.wait_for(
+                process.communicate(json.dumps(payload, ensure_ascii=False).encode()),
+                timeout=float(extra.get("jev_reply_gate_timeout", 12)),
+            )
+            if process.returncode != 0:
+                raise RuntimeError(f"helper exited {process.returncode}: {stderr.decode(errors='replace')[:200]}")
+            answer = json.loads(stdout.decode()).get("answers", {}).get("action", {})
+            allowed = answer.get("choice") == "answer" and float(answer.get("confidence", 0.0)) >= float(extra.get("jev_reply_gate_threshold", 0.85))
+            if not allowed:
+                logger.info("[Telegram] Jev reply gate suppressed group message: choice=%s confidence=%s", answer.get("choice"), answer.get("confidence"))
+            return allowed
+        except Exception as exc:
+            logger.warning("[Telegram] Jev reply gate failed closed: %s", _redact_telegram_error_text(exc))
+            return False
+        finally:
+            if process is not None and process.returncode is None:
+                process.kill()
+                try:
+                    await process.wait()
+                except Exception:
+                    logger.debug("[Telegram] Failed to reap Jev gate helper", exc_info=True)
+
+    async def _flush_buffered(self, pending: dict, tasks: dict, key: str, delay: float, where: str, log_fn=None, before_dispatch=None) -> None:
         """Shared delayed-flush body: sleep, pop, hold if teardown started, else dispatch. A cancel after
         the pop but before durable dispatch re-holds the event (never lose it)."""
         current_task = asyncio.current_task()
@@ -6600,6 +6651,9 @@ class TelegramAdapter(TelegramHeldInboundMixin, TelegramTopicRoutingMixin, BaseP
                 return
             if log_fn is not None:
                 log_fn(event)
+            if before_dispatch is not None and not await before_dispatch(event):
+                event = None
+                return
             await self.handle_message(event)
             event = None
         except asyncio.CancelledError:
@@ -6632,7 +6686,9 @@ class TelegramAdapter(TelegramHeldInboundMixin, TelegramTopicRoutingMixin, BaseP
         await self._flush_buffered(
             self._pending_text_batches, self._pending_text_batch_tasks, key,
             self._text_batch_delay_for(self._pending_text_batches.get(key)), "text",
-            lambda ev: logger.info("[Telegram] Flushing text batch %s (%d chars)", key, len(ev.text or "")))
+            lambda ev: logger.info("[Telegram] Flushing text batch %s (%d chars)", key, len(ev.text or "")),
+            before_dispatch=self._jev_allows_reply,
+        )
 
     # -- Photo batching --
 
