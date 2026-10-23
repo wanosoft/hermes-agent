@@ -72,6 +72,17 @@ class TestBuildAnthropicClient:
             assert "oauth-2025-04-20" not in betas  # OAuth-only beta NOT present
             assert "claude-code-20250219" not in betas  # OAuth-only beta NOT present
 
+    def test_api_key_passes_configured_workspace_header(self):
+        """Native Anthropic clients honor model.default_headers like OpenAI clients."""
+        with patch("agent.anthropic_adapter._anthropic_sdk") as mock_sdk, patch(
+            "agent.anthropic_adapter._model_default_headers",
+            return_value={"anthropic-workspace-id": "wrkspc_test"},
+        ):
+            build_anthropic_client("sk-ant-api-key")
+            headers = mock_sdk.Anthropic.call_args[1]["default_headers"]
+            assert headers["anthropic-workspace-id"] == "wrkspc_test"
+            assert "anthropic-beta" in headers
+
 
     def test_opencode_endpoint_gets_attribution_headers(self):
         """OpenCode identifies clients by request headers, like OpenRouter.

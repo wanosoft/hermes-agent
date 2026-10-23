@@ -447,6 +447,11 @@ def _new_sdk_client(sdk, kwargs: dict[str, Any], headers: dict[str, str], route:
         merged["Authorization"] = sdk.Omit()
     elif "auth_token" in kwargs and "api_key" not in kwargs:
         merged["X-Api-Key"] = sdk.Omit()
+    # Configured model headers must reach Anthropic's native Messages SDK too.
+    # The OpenAI-wire lifecycle already applies these; without this merge an
+    # organization-scoped Anthropic key cannot select its workspace with
+    # ``anthropic-workspace-id``.
+    merged.update(_model_default_headers())
     # Per-provider ``custom_providers[].extra_headers`` last: the most specific config level wins
     # over the SDK User-Agent and the attribution/beta sets above, on every builder path (init,
     # /model switch, rebuild, auxiliary) — the OpenAI-wire clients already do this (#24293, #9721).
@@ -454,6 +459,27 @@ def _new_sdk_client(sdk, kwargs: dict[str, Any], headers: dict[str, str], route:
     if merged:
         kwargs["default_headers"] = merged
     return sdk.Anthropic(**kwargs)
+
+
+def _model_default_headers() -> dict[str, str]:
+    """Return user-configured model headers for native Anthropic clients.
+
+    ``model.extra_headers`` remains an alias and overrides duplicate keys, as
+    it does for OpenAI-wire primary and auxiliary clients. Values can include
+    credentials, so callers must never log this mapping.
+    """
+    try:
+        from hermes_cli.config import cfg_get, load_config
+        config = load_config()
+        headers = cfg_get(config, "model", "default_headers")
+        aliases = cfg_get(config, "model", "extra_headers")
+        merged = dict(headers) if isinstance(headers, dict) else {}
+        if isinstance(aliases, dict):
+            merged.update(aliases)
+        return {str(key): str(value) for key, value in merged.items() if value is not None}
+    except Exception:
+        logger.debug("model default headers skipped for Anthropic client", exc_info=True)
+        return {}
 
 
 def _custom_provider_extra_headers(base_url) -> dict[str, str]:
